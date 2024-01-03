@@ -5,6 +5,7 @@ using Distributed
 using KernelAbstractions, Adapt
 
 import Dagger: Chunk
+import LinearAlgebra
 
 const CPUProc = Union{OSProc, Dagger.ThreadProc}
 

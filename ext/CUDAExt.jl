@@ -13,6 +13,7 @@ else
     import ..CUDA
 end
 import CUDA: CuDevice, CuContext, CuArray, CUDABackend, devices, attribute
+import CUDA: CUBLAS, CUSOLVER
 
 using UUIDs
 
@@ -22,8 +23,22 @@ struct CuArrayDeviceProc <: Dagger.Processor
     device::Int
     device_uuid::UUID
 end
+"Represents the memory space of a single CUDA GPU's VRAM."
+struct CUDAVRAMMemorySpace <: Dagger.MemorySpace
+    owner::Int
+    device::Int
+    device_uuid::UUID
+end
 DaggerGPU.@gpuproc(CuArrayDeviceProc, CuArray)
 Dagger.get_parent(proc::CuArrayDeviceProc) = Dagger.OSProc(proc.owner)
+function Dagger.get_memory_space(x::CuArray)
+    dev = CUDA.device(x)
+    device_id = dev.handle
+    device_uuid = CUDA.uuid(dev)
+    return CUDAVRAMMemorySpace(myid(), device_id, device_uuid)
+end
+Dagger.get_memory_spaces(proc::CuArrayDeviceProc) = [CUDAVRAMMemorySpace(proc.owner, proc.device, proc.device_uuid)]
+Dagger.get_processors(space::CUDAVRAMMemorySpace) = [CuArrayDeviceProc(space.owner, space.device, space.device_uuid)]
 
 # function can_access(this, peer)
 #     status = Ref{Cint}()
@@ -96,6 +111,17 @@ function Dagger.move(from_proc::CuArrayDeviceProc, to_proc::CPUProc, x::CuArray{
     _x = Array{T,N}(undef, size(x))
     copyto!(_x, x)
     return _x
+end
+
+# TODO: Create these automatically
+import DaggerGPU: LinearAlgebra.BLAS, LinearAlgebra.LAPACK
+import .LAPACK: potrf!
+for fn in [potrf!]
+    Dagger.move(from_proc::CPUProc, to_proc::CuArrayDeviceProc, ::typeof(fn)) = getproperty(CUSOLVER, nameof(fn))
+end
+import .BLAS: trsm!, syrk!, gemm!
+for fn in [trsm!, syrk!, gemm!]
+    Dagger.move(from_proc::CPUProc, to_proc::CuArrayDeviceProc, ::typeof(fn)) = getproperty(CUBLAS, nameof(fn))
 end
 
 function Dagger.execute!(proc::CuArrayDeviceProc, f, args...; kwargs...)
