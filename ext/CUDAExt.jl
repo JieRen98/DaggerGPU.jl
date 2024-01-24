@@ -40,6 +40,34 @@ end
 Dagger.get_memory_spaces(proc::CuArrayDeviceProc) = [CUDAVRAMMemorySpace(proc.owner, proc.device, proc.device_uuid)]
 Dagger.get_processors(space::CUDAVRAMMemorySpace) = [CuArrayDeviceProc(space.owner, space.device, space.device_uuid)]
 
+function Dagger.move!(to_space::Dagger.CPURAMMemorySpace, from_space::CUDAVRAMMemorySpace, to::AbstractArray{T,N}, from::AbstractArray{T,N}) where {T,N}
+    if to_space.owner == from_space.owner
+        copyto!(to, from)
+        CUDA.synchronize()
+    else
+        error("Cross-worker GPU->CPU move! not yet implemented")
+    end
+    return
+end
+function Dagger.move!(to_space::CUDAVRAMMemorySpace, from_space::Dagger.CPURAMMemorySpace, to::AbstractArray{T,N}, from::AbstractArray{T,N}) where {T,N}
+    if to_space.owner == from_space.owner
+        copyto!(to, from)
+        CUDA.synchronize()
+    else
+        error("Cross-worker CPU->GPU move! not yet implemented")
+    end
+    return
+end
+function Dagger.move!(to_space::CUDAVRAMMemorySpace, from_space::CUDAVRAMMemorySpace, to::AbstractArray{T,N}, from::AbstractArray{T,N}) where {T,N}
+    if to_space.owner == from_space.owner
+        copyto!(to, from)
+        CUDA.synchronize()
+    else
+        error("Cross-worker GPU->GPU move! not yet implemented")
+    end
+    return
+end
+
 # function can_access(this, peer)
 #     status = Ref{Cint}()
 #     CUDA.cuDeviceCanAccessPeer(status, this, peer)
