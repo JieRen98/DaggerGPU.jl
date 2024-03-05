@@ -31,6 +31,13 @@ macro gpuproc(PROC, T)
         # CPUs shouldn't process our array type
         Dagger.iscompatible_arg(proc::Dagger.ThreadProc, opts, x::$T) = false
 
+        #= Allow mapping CPU functions to GPU functions
+        function Dagger.move(from_proc::CPUProc, to_proc::$PROC, x::Chunk{T}) where {T<:Type}
+            CT = Dagger.chunktype(x)
+            @info "Mapping $T to $CT"
+            Dagger.move(from_proc, to_proc, Dagger.chunktype(x))
+        end
+
         # Adapt to/from the appropriate type
         function Dagger.move(from_proc::CPUProc, to_proc::$PROC, x::Chunk)
             from_pid = Dagger.get_parent(from_proc).pid
@@ -72,6 +79,7 @@ macro gpuproc(PROC, T)
                 return adapt(Array, x)
             end
         end
+        =#
     end
 end
 
