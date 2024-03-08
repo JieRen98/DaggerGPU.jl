@@ -16,7 +16,8 @@ if isdefined(Base, :get_extension)
 else
     import ..CUDA
 end
-import CUDA: CuDevice, CuContext, CuArray, CUDABackend, devices, attribute, context, context!
+import CUDA: CuDevice, CuContext, CuStream, CuArray, CUDABackend
+import CUDA: devices, attribute, context, context!, stream, stream!
 import CUDA: CUBLAS, CUSOLVER
 
 using UUIDs
@@ -52,49 +53,70 @@ Dagger.memory_spaces(proc::CuArrayDeviceProc) = Set([CUDAVRAMMemorySpace(proc.ow
 Dagger.processors(space::CUDAVRAMMemorySpace) = Set([CuArrayDeviceProc(space.owner, space.device, space.device_uuid)])
 
 unwrap(x::Chunk) = MemPool.poolget(x.handle)
-# TODO: No extra allocations here
-to_device(proc::CuArrayDeviceProc) = collect(CUDA.devices())[proc.device+1]
-with_context!(ctx::CuContext) = context!(ctx)
-with_context!(proc::CuArrayDeviceProc) = with_context!(context(to_device(proc)))
-with_context!(x::CuArray) = with_context!(context(x))
+function to_device(proc::CuArrayDeviceProc)
+    @assert Dagger.root_worker_id(proc) == myid()
+    return DEVICES[proc.device]
+end
+function to_context(proc::CuArrayDeviceProc)
+    @assert Dagger.root_worker_id(proc) == myid()
+    return CONTEXTS[proc.device]
+end
+to_context(handle::Integer) = CONTEXTS[handle]
+to_context(dev::CuDevice) = to_context(dev.handle)
+
+function with_context!(handle::Integer)
+    context!(CONTEXTS[handle])
+    stream!(STREAMS[handle])
+end
+function with_context!(proc::CuArrayDeviceProc)
+    @assert Dagger.root_worker_id(proc) == myid()
+    with_context!(proc.device)
+end
+function with_context!(space::CUDAVRAMMemorySpace)
+    @assert Dagger.root_worker_id(space) == myid()
+    with_context!(space.device)
+end
 function with_context(f, x)
     old_ctx = context()
+    old_stream = stream()
+
     with_context!(x)
     try
         f()
     finally
         context!(old_ctx)
+        stream!(old_stream)
+    end
+end
+
+function sync_with_context(x::Union{Dagger.Processor,Dagger.MemorySpace})
+    if Dagger.root_worker_id(x) == myid()
+        with_context(CUDA.synchronize, x)
+    else
+        # Do nothing, as we have received our value over a serialization
+        # boundary, which should synchronize for us
     end
 end
 
 # In-place
+# N.B. These methods assume that later operations will implicitly or
+# explicitly synchronize with their associated stream
 function Dagger.move!(to_space::Dagger.CPURAMMemorySpace, from_space::CUDAVRAMMemorySpace, to::AbstractArray{T,N}, from::AbstractArray{T,N}) where {T,N}
-    if from isa CuArray
-        with_context!(from)
-        CUDA.synchronize()
-    end
+    sync_with_context(from_space)
+    with_context!(from_space)
     copyto!(to, from)
-    if from isa CuArray
-        CUDA.synchronize()
-    end
+    # N.B. DtoH will synchronize
     return
 end
 function Dagger.move!(to_space::CUDAVRAMMemorySpace, from_space::Dagger.CPURAMMemorySpace, to::AbstractArray{T,N}, from::AbstractArray{T,N}) where {T,N}
-    if to isa CuArray
-        with_context!(to)
-    end
+    with_context!(to_space)
     copyto!(to, from)
-    if to isa CuArray
-        CUDA.synchronize()
-    end
     return
 end
 function Dagger.move!(to_space::CUDAVRAMMemorySpace, from_space::CUDAVRAMMemorySpace, to::AbstractArray{T,N}, from::AbstractArray{T,N}) where {T,N}
-    with_context(CUDA.synchronize, from)
-    with_context(to) do
-        copyto!(to, from)
-        CUDA.synchronize()
-    end
+    sync_with_context(from_space)
+    with_context!(to_space)
+    copyto!(to, from)
     return
 end
 
@@ -139,7 +161,9 @@ end
 function Dagger.move(from_proc::CuArrayDeviceProc, to_proc::CPUProc, x)
     with_context(from_proc) do
         CUDA.synchronize()
-        return adapt(Array, x)
+        _x = adapt(Array, x)
+        CUDA.synchronize()
+        return _x
     end
 end
 function Dagger.move(from_proc::CuArrayDeviceProc, to_proc::CPUProc, x::Chunk)
@@ -156,31 +180,31 @@ function Dagger.move(from_proc::CuArrayDeviceProc, to_proc::CPUProc, x::CuArray{
         CUDA.synchronize()
         _x = Array{T,N}(undef, size(x))
         copyto!(_x, x)
+        CUDA.synchronize()
         return _x
     end
 end
 
 # Out-of-place DtoD
-function Dagger.move(from::CuArrayDeviceProc, to::CuArrayDeviceProc, x::Dagger.Chunk{T}) where T<:CuArray
-    if from == to
+function Dagger.move(from_proc::CuArrayDeviceProc, to_proc::CuArrayDeviceProc, x::Dagger.Chunk{T}) where T<:CuArray
+    if from_proc == to_proc
         # Same process and GPU, no change
         arr = unwrap(x)
-        with_context(CUDA.synchronize, context(arr))
+        with_context(CUDA.synchronize, from_proc)
         return arr
-    elseif from.owner == to.owner
+    elseif Dagger.root_worker_id(from_proc) == Dagger.root_worker_id(to_proc)
         # Same process but different GPUs, use DtoD copy
         from_arr = unwrap(x)
         with_context(CUDA.synchronize, context(from_arr))
-        return with_context(to) do
+        return with_context(to_proc) do
             to_arr = similar(from_arr)
             copyto!(to_arr, from_arr)
             CUDA.synchronize()
             to_arr
         end
-    elseif Dagger.system_uuid(from.owner) == Dagger.system_uuid(to.owner)
-        error("TODO: Remove me")
+    elseif Dagger.system_uuid(from_proc.owner) == Dagger.system_uuid(to_proc.owner) && from_proc.device_uuid == to_proc.device_uuid
         # Same node, we can use IPC
-        ipc_handle, eT, shape = remotecall_fetch(from.owner, x) do x
+        ipc_handle, eT, shape = remotecall_fetch(from_proc.owner, x) do x
             arr = unwrap(x)
             ipc_handle_ref = Ref{CUDA.CUipcMemHandle}()
             GC.@preserve arr begin
@@ -189,7 +213,7 @@ function Dagger.move(from::CuArrayDeviceProc, to::CuArrayDeviceProc, x::Dagger.C
             (ipc_handle_ref[], eltype(arr), size(arr))
         end
         r_ptr = Ref{CUDA.CUdeviceptr}()
-        CUDA.device!(from.device) do # FIXME: Assumes that device IDs are identical across processes
+        CUDA.device!(from_proc.device) do
             CUDA.cuIpcOpenMemHandle(r_ptr, ipc_handle, CUDA.CU_IPC_MEM_LAZY_ENABLE_PEER_ACCESS)
         end
         ptr = Base.unsafe_convert(CUDA.CuPtr{eT}, r_ptr[])
@@ -197,8 +221,8 @@ function Dagger.move(from::CuArrayDeviceProc, to::CuArrayDeviceProc, x::Dagger.C
         finalizer(arr) do arr
             CUDA.cuIpcCloseMemHandle(pointer(arr))
         end
-        if from.device_uuid != to.device_uuid
-            return CUDA.device!(to.device) do
+        if from_proc.device_uuid != to_proc.device_uuid
+            return CUDA.device!(to_proc.device) do
                 to_arr = similar(arr)
                 copyto!(to_arr, arr)
                 to_arr
@@ -207,46 +231,34 @@ function Dagger.move(from::CuArrayDeviceProc, to::CuArrayDeviceProc, x::Dagger.C
             return arr
         end
     else
-        error("TODO: Remove me")
         # Different node, use DtoH, serialization, HtoD
-        # TODO UCX
-        return CuArray(remotecall_fetch(from.owner, x.handle) do h
-            Array(MemPool.poolget(h))
+        return CuArray(remotecall_fetch(from_proc.owner, x) do x
+            Array(unwrap(x))
         end)
     end
 end
 
 # Adapt generic functions
+Dagger.move(from_proc::CPUProc, to_proc::CuArrayDeviceProc, x::Function) = x
 Dagger.move(from_proc::CPUProc, to_proc::CuArrayDeviceProc, x::Chunk{T}) where {T<:Function} =
     Dagger.move(from_proc, to_proc, fetch(x))
 
 # Adapt BLAS/LAPACK functions
-# TODO: Create these automatically
 import LinearAlgebra: BLAS, LAPACK
-import .LAPACK: potrf!
-for fn in [potrf!]
-    Dagger.move(from_proc::CPUProc, to_proc::CuArrayDeviceProc, ::typeof(fn)) = getproperty(CUSOLVER, nameof(fn))
-end
-function potrf_checked!(uplo, A, info_arr)
-    @assert context() === context(A)
-    was_posdef = LinearAlgebra.isposdef(A)
-    if !was_posdef
-        sleep(1)
+for lib in [BLAS, LAPACK]
+    for name in names(lib; all=true)
+        name == nameof(lib) && continue
+        startswith(string(name), '#') && continue
+        endswith(string(name), '!') || continue
+
+        for culib in [CUBLAS, CUSOLVER]
+            if name in names(culib; all=true)
+                fn = getproperty(lib, name)
+                cufn = getproperty(culib, name)
+                @eval Dagger.move(from_proc::CPUProc, to_proc::CuArrayDeviceProc, ::$(typeof(fn))) = $cufn
+            end
+        end
     end
-    @show (was_posdef, LinearAlgebra.isposdef(A))
-    _A, info = CUSOLVER.potrf!(uplo, A)
-    @assert context() === context(_A)
-    @show info
-    if info > 0
-        fill!(info_arr, info)
-        throw(LinearAlgebra.PosDefException(info))
-    end
-    return _A, info
-end
-Dagger.move(from_proc::CPUProc, to_proc::CuArrayDeviceProc, ::typeof(Dagger.potrf_checked!)) = potrf_checked!
-import .BLAS: trsm!, syrk!, gemm!
-for fn in [trsm!, syrk!, gemm!]
-    Dagger.move(from_proc::CPUProc, to_proc::CuArrayDeviceProc, ::typeof(fn)) = getproperty(CUBLAS, nameof(fn))
 end
 
 # Task execution
@@ -255,23 +267,9 @@ function Dagger.execute!(proc::CuArrayDeviceProc, f, args...; kwargs...)
     tls = Dagger.get_tls()
     task = Threads.@spawn begin
         Dagger.set_tls!(tls)
-        dev = to_device(proc)
-        ctx = context(dev)
-        # FIXME: Remove me
-        for arg in args
-            if arg isa CuArray
-                if f != Dagger.move!
-                    if ctx != context(arg)
-                        println("WARN: mismatched context ($ctx vs arg $(context(arg))), ($dev vs arg $(CUDA.device(arg))), type $(typeof(arg))")
-                    end
-                    @assert ctx == context(arg)
-                end
-                with_context(CUDA.synchronize, arg)
-            end
-        end
-        with_context!(ctx)
+        with_context!(proc)
         result = Base.@invokelatest f(args...; kwargs...)
-        CUDA.synchronize()
+        # N.B. Synchronization must be done when accessing result or args
         return result
     end
 
@@ -299,7 +297,6 @@ function Dagger.to_scope(::Val{:cuda_gpus}, sc::NamedTuple)
     elseif haskey(sc, :workers) && sc.workers != Colon()
         workers = sc.workers
     else
-        # FIXME: Check context
         workers = map(gproc->gproc.pid, Dagger.procs(Dagger.Sch.eager_context()))
     end
     scopes = Dagger.ExactScope[]
@@ -318,12 +315,23 @@ function Dagger.to_scope(::Val{:cuda_gpus}, sc::NamedTuple)
 end
 Dagger.scope_key_precedence(::Val{:cuda_gpus}) = 1
 
+const DEVICES = Dict{Int, CuDevice}()
+const CONTEXTS = Dict{Int, CuContext}()
+const STREAMS = Dict{Int, CuStream}()
+
 function __init__()
     if CUDA.has_cuda()
         for dev in CUDA.devices()
             @debug "Registering CUDA GPU processor with Dagger: $dev"
             Dagger.add_processor_callback!("cuarray_device_$(dev.handle)") do
-                CuArrayDeviceProc(myid(), dev.handle, CUDA.uuid(dev))
+                proc = CuArrayDeviceProc(myid(), dev.handle, CUDA.uuid(dev))
+                DEVICES[dev.handle] = dev
+                ctx = context(dev)
+                CONTEXTS[dev.handle] = ctx
+                context!(ctx) do
+                    STREAMS[dev.handle] = stream()
+                end
+                return proc
             end
         end
     end
