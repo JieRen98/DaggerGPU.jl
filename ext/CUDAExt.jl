@@ -289,7 +289,7 @@ DaggerGPU.with_device(f, proc::CuArrayDeviceProc) =
     CUDA.device!(f, proc.device)
 
 Dagger.to_scope(::Val{:cuda_gpu}, sc::NamedTuple) =
-    Dagger.to_scope(Val{:cuda_gpus}, merge(sc, (;cuda_gpus=[sc.cuda_gpu])))
+    Dagger.to_scope(Val{:cuda_gpus}(), merge(sc, (;cuda_gpus=[sc.cuda_gpu])))
 Dagger.scope_key_precedence(::Val{:cuda_gpu}) = 1
 function Dagger.to_scope(::Val{:cuda_gpus}, sc::NamedTuple)
     if haskey(sc, :worker)
